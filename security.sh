@@ -17,6 +17,8 @@ CERTIFICATE=""
 ALIAS=""
 COMMAND=""
 CACERT=""
+AGENT=""
+DARWIN_VERSION_MAJOR=$( uname -r | sed 's|\([^.]\)\..*|\1|g' )
 
 if [ -f ~/Library/Keychains/.keychain_pass ]; then
 	chmod 400 ~/Library/Keychains/.keychain_pass
@@ -38,7 +40,7 @@ while [ $# -gt 0 ]; do
 			ACCOUNT=${1#*=}
 			;;
 		--service=*)
-			SERVICE=${1#*=}
+			SERVICE="${1#*=}"
 			;;
 		--password=*)
 			PASSWORD=${1#*=}
@@ -51,6 +53,9 @@ while [ $# -gt 0 ]; do
 			;;
 		--alias=*)
 			ALIAS=${1#*=}
+			;;
+		--agent)
+			AGENT=${1}
 			;;
 		*)
 			echo "Unknown option $1" 1>&2
@@ -73,18 +78,27 @@ if [ "$COMMAND" == "show-password" ]; then
 	exit 0
 fi
 
-if [ "$COMMAND" != "lock" ]; then
+if [ "${COMMAND}" != "lock" ] ; then
 	security unlock-keychain -p ${OSX_KEYCHAIN_PASS} ${OSX_KEYCHAIN}
 fi
 case $COMMAND in
 	set-password)
 		if [[ ! -z $ACCOUNT && ! -z $SERVICE && ! -z $PASSWORD ]]; then
-			security add-generic-password -U -w ${PASSWORD} -a ${ACCOUNT} -s ${SERVICE} ${OSX_KEYCHAIN}
+			if [ $DARWIN_VERSION_MAJOR -ne 10 ]; then
+				security add-generic-password -U -w ${PASSWORD} -a ${ACCOUNT} -s "${SERVICE}" ${OSX_KEYCHAIN}
+			else
+				security 2>/dev/null delete-generic-password -a ${ACCOUNT} -s "${SERVICE}" ${OSX_KEYCHAIN} >/dev/null
+				security add-generic-password -w ${PASSWORD} -a ${ACCOUNT} -s "${SERVICE}" ${OSX_KEYCHAIN}
+			fi
 		fi
 		;;
 	get-password)		
 		if [[ ! -z $ACCOUNT && ! -z $SERVICE ]]; then
-			security find-generic-password -w -a ${ACCOUNT} -s ${SERVICE} ${OSX_KEYCHAIN}
+			if [ $DARWIN_VERSION_MAJOR -ge 12 ]; then
+				security find-generic-password -w -a ${ACCOUNT} -s "${SERVICE}" ${OSX_KEYCHAIN}
+			else
+				security 2>&1 find-generic-password -g -a ${ACCOUNT} -s "${SERVICE}" ${OSX_KEYCHAIN} | grep ^password | sed 's|^password: "\(.*\)"$|\1|g'
+			fi
 		fi
 		;;
 	add-apple-certificate)
@@ -94,7 +108,11 @@ case $COMMAND in
 		;;
 	add-java-certificate)
 		if [[ ! -z $ALIAS && -f $CERTIFICATE ]]; then
-			KEYSTORE_PASS=$( security find-generic-password -w -a `whoami` -s java_truststore ${OSX_KEYCHAIN} )
+			if [ $DARWIN_VERSION_MAJOR -ge 12 ]; then
+				KEYSTORE_PASS=$( security find-generic-password -w -a `whoami` -s java_truststore ${OSX_KEYCHAIN} )
+			else
+				KEYSTORE_PASS=$( security 2>&1 find-generic-password -g -a `whoami` -s java_truststore ${OSX_KEYCHAIN} | grep ^password | sed 's|^password: "\(.*\)"$|\1|g' )
+			fi
 			keytool -import ${CA_CERT} -alias ${ALIAS} -file ${CERTIFICATE} -storepass ${KEYSTORE_PASS}
 		fi
 		;;
@@ -106,5 +124,7 @@ case $COMMAND in
 		;;
 esac
 if [[ "$COMMAND" != "unlock" || ! -f ${OSX_KEYCHAIN_LOCK} ]]; then
-	security lock-keychain ${OSX_KEYCHAIN}
+	if [ "${AGENT}" != "--agent" ]; then
+		security lock-keychain ${OSX_KEYCHAIN}
+	fi
 fi

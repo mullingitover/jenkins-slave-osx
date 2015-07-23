@@ -7,10 +7,12 @@
 set -u
 
 SERVICE_USER=${SERVICE_USER:-"jenkins"}
+SERVICE_GROUP=${SERVICE_GROUP:-"${SERVICE_USER}"}
 SERVICE_HOME=${SERVICE_HOME:-"/var/lib/${SERVICE_USER}"}
-SERVICE_CONF=${SERVICE_HOME}/Library/Preferences/org.jenkins-ci.slave.jnlp.conf
-MASTER_NAME=""							# set default to jenkins later
-MASTER_USER=""							# set default to `whoami` later
+SERVICE_CONF=""   # set in create_user function
+SERVICE_WRKSPC="" # set in create_user function
+MASTER_NAME=""    # set default to jenkins later
+MASTER_USER=""    # set default to `whoami` later
 MASTER=""
 MASTER_HTTP_PORT=""
 SLAVE_NODE=""
@@ -19,52 +21,60 @@ OSX_KEYCHAIN="login.keychain"
 OSX_KEYCHAIN_PASS=""
 JAVA_ARGS=${JAVA_ARGS:-""}
 INSTALL_TMP=`mktemp -d -q -t org.jenkins-ci.slave.jnlp`
+DOWNLOADS_PATH=https://raw.github.com/rhwood/jenkins-slave-osx/master
 
 function create_user() {
 	# see if user exists
 	if dscl /Local/Default list /Users | grep -q ${SERVICE_USER} ; then
 		echo "Using pre-existing service account ${SERVICE_USER}"
-		SERVICE_HOME=`dscl /Local/Default read /Users/${SERVICE_USER} NFSHomeDirectory | awk '{print $2}'`
-		return 0
+		SERVICE_HOME=$( dscl /Local/Default read /Users/${SERVICE_USER} NFSHomeDirectory | awk '{ print $2 }' )
+		SERVICE_GROUP=$( dscl /Local/Default search /Groups gid $( dscl /Local/Default read /Users/${SERVICE_USER} PrimaryGroupID | awk '{ print $2 }' ) | head -n1 | awk '{ print $1 }' )
+	else
+		echo "Creating service account ${SERVICE_USER}..."
+		if dscl /Local/Default list /Groups | grep -q ${SERVICE_GROUP} ; then
+			NEXT_GID=$( dscl /Local/Default list /Groups gid | grep ${SERVICE_GROUP} | awk '{ print $2 }' )
+		else
+			# create jenkins group
+			NEXT_GID=$((`dscl /Local/Default list /Groups gid | awk '{ print $2 }' | sort -n | grep -v ^[5-9] | tail -n1` + 1))
+			sudo dscl /Local/Default create /Groups/${SERVICE_GROUP}
+			sudo dscl /Local/Default create /Groups/${SERVICE_GROUP} PrimaryGroupID $NEXT_GID
+			sudo dscl /Local/Default create /Groups/${SERVICE_GROUP} Password \*
+			sudo dscl /Local/Default create /Groups/${SERVICE_GROUP} RealName 'Jenkins Node Service'
+		fi
+		# create jenkins user
+		NEXT_UID=$((`dscl /Local/Default list /Users uid | awk '{ print $2 }' | sort -n | grep -v ^[5-9] | tail -n1` + 1))
+		sudo dscl /Local/Default create /Users/${SERVICE_USER}
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} UniqueID $NEXT_UID
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} PrimaryGroupID $NEXT_GID
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} UserShell /bin/bash
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} NFSHomeDirectory ${SERVICE_HOME}
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} Password \*
+		sudo dscl /Local/Default create /Users/${SERVICE_USER} RealName 'Jenkins Node Service'
+		sudo dseditgroup -o edit -a ${SERVICE_USER} -t user ${SERVICE_USER}
 	fi
-	echo "Creating service account ${SERVICE_USER}..."
-	# create jenkins group
-	NEXT_GID=$((`dscl /Local/Default list /Groups gid | awk '{ print $2 }' | sort -n | grep -v ^[5-9] | tail -n1` + 1))
-	sudo dscl /Local/Default create /Groups/${SERVICE_USER}
-	sudo dscl /Local/Default create /Groups/${SERVICE_USER} PrimaryGroupID $NEXT_GID
-	sudo dscl /Local/Default create /Groups/${SERVICE_USER} Password \*
-	sudo dscl /Local/Default create /Groups/${SERVICE_USER} RealName 'Jenkins Node Service'
-	# create jenkins user
-	NEXT_UID=$((`dscl /Local/Default list /Users uid | awk '{ print $2 }' | sort -n | grep -v ^[5-9] | tail -n1` + 1))
-	sudo dscl /Local/Default create /Users/${SERVICE_USER}
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} UniqueID $NEXT_UID
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} PrimaryGroupID $NEXT_GID
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} UserShell /bin/bash
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} NFSHomeDirectory ${SERVICE_HOME}
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} Password \*
-	sudo dscl /Local/Default create /Users/${SERVICE_USER} RealName 'Jenkins Node Service'
-	sudo dseditgroup -o edit -a ${SERVICE_USER} -t user ${SERVICE_USER}
+	SERVICE_CONF=${SERVICE_HOME}/Library/Preferences/org.jenkins-ci.slave.jnlp.conf
+	SERVICE_WRKSPC=${SERVICE_HOME}/Library/Developer/org.jenkins-ci.slave.jnlp
 }
 
 function install_files() {
 	# create the jenkins home dir
-	if [ ! -d ${SERVICE_HOME} ] ; then
-		sudo mkdir ${SERVICE_HOME}
+	if [ ! -d ${SERVICE_WRKSPC} ] ; then
+		sudo mkdir -p ${SERVICE_WRKSPC}
 	fi
 	# download the LaunchDaemon
-	sudo curl --silent --url https://raw.github.com/rhwood/jenkins-slave-osx/master/org.jenkins-ci.slave.jnlp.plist -o ${SERVICE_HOME}/org.jenkins-ci.slave.jnlp.plist
-	sudo sed -i '' "s#\${JENKINS_HOME}#${SERVICE_HOME}#g" ${SERVICE_HOME}/org.jenkins-ci.slave.jnlp.plist
-	sudo sed -i '' "s#\${JENKINS_USER}#${SERVICE_USER}#g" ${SERVICE_HOME}/org.jenkins-ci.slave.jnlp.plist
+	sudo curl --silent -L --url ${DOWNLOADS_PATH}/org.jenkins-ci.slave.jnlp.plist -o ${SERVICE_WRKSPC}/org.jenkins-ci.slave.jnlp.plist
+	sudo sed -i '' "s#\${JENKINS_HOME}#${SERVICE_WRKSPC}#g" ${SERVICE_WRKSPC}/org.jenkins-ci.slave.jnlp.plist
+	sudo sed -i '' "s#\${JENKINS_USER}#${SERVICE_USER}#g" ${SERVICE_WRKSPC}/org.jenkins-ci.slave.jnlp.plist
 	sudo rm -f /Library/LaunchDaemons/org.jenkins-ci.slave.jnlp.plist
-	sudo install -o root -g wheel -m 644 ${SERVICE_HOME}/org.jenkins-ci.slave.jnlp.plist /Library/LaunchDaemons/org.jenkins-ci.slave.jnlp.plist
+	sudo install -o root -g wheel -m 644 ${SERVICE_WRKSPC}/org.jenkins-ci.slave.jnlp.plist /Library/LaunchDaemons/org.jenkins-ci.slave.jnlp.plist
 	# download the jenkins JNLP slave script
-	sudo curl --silent --url https://raw.github.com/rhwood/jenkins-slave-osx/master/slave.jnlp.sh -o ${SERVICE_HOME}/slave.jnlp.sh
-	sudo chmod 755 ${SERVICE_HOME}/slave.jnlp.sh
+	sudo curl --silent -L --url ${DOWNLOADS_PATH}/slave.jnlp.sh -o ${SERVICE_WRKSPC}/slave.jnlp.sh
+	sudo chmod 755 ${SERVICE_WRKSPC}/slave.jnlp.sh
 	# download the jenkins JNLP security helper script
-	sudo curl --silent --url https://raw.github.com/rhwood/jenkins-slave-osx/master/security.sh -o ${SERVICE_HOME}/security.sh
-	sudo chmod 755 ${SERVICE_HOME}/security.sh
+	sudo curl --silent -L --url ${DOWNLOADS_PATH}/security.sh -o ${SERVICE_WRKSPC}/security.sh
+	sudo chmod 755 ${SERVICE_WRKSPC}/security.sh
 	# jenkins should own jenkin's home directory and all its contents
-	sudo chown -R ${SERVICE_USER}:${SERVICE_USER} ${SERVICE_HOME}
+	sudo chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${SERVICE_HOME}
 	# create a logging space
 	if [ ! -d /var/log/${SERVICE_USER} ] ; then
 		sudo mkdir /var/log/${SERVICE_USER}
@@ -77,7 +87,7 @@ function process_args {
 		sudo chmod 666 ${SERVICE_CONF}
 		source ${SERVICE_CONF}
 		sudo chmod 400 ${SERVICE_CONF}
-		SLAVE_NODE=${SLAVE_NODE:-$JENKINS_SLAVE}
+		SLAVE_NODE="${SLAVE_NODE:-$JENKINS_SLAVE}"
 		MASTER=${MASTER:-$JENKINS_MASTER}
 		MASTER_HTTP_PORT=${HTTP_PORT}
 		MASTER_USER=${MASTER_USER:-$JENKINS_USER}
@@ -89,10 +99,10 @@ function process_args {
 	fi
 	while [ $# -gt 0 ]; do
 		case $1 in
-			--node=*) SLAVE_NODE=${1#*=} ;;
+			--node=*) SLAVE_NODE="${1#*=}" ;;
 			--user=*) MASTER_USER=${1#*=} ;;
 			--master=*) MASTER=${1#*=} ;;
-			--java-args=*) JAVA_ARGS=${1#*=} ;;
+			--java-args=*) JAVA_ARGS="${1#*=}" ;;
 		esac
 		shift
 	done
@@ -105,7 +115,7 @@ function configure_daemon {
 		read -p "URL for Jenkins master [$MASTER]: " RESPONSE
 		MASTER=${RESPONSE:-$MASTER}
 	fi
-	while ! curl --location --url ${MASTER}/jnlpJars/slave.jar --silent --fail --output ${INSTALL_TMP}/slave.jar ; do
+	while ! curl -L --url ${MASTER}/jnlpJars/slave.jar --insecure --location --silent --fail --output ${INSTALL_TMP}/slave.jar ; do
 		echo "Unable to connect to Jenkins at ${MASTER}"
 		read -p "URL for Jenkins master: " MASTER
 	done
@@ -120,11 +130,11 @@ function configure_daemon {
 		[ -z $MASTER_HTTP_PORT ] || MASTER="${PROTOCOL}:`echo $MASTER | cut -d':' -f2`"
 	fi
 	[ ! -z $MASTER_HTTP_PORT ] && MASTER_HTTP_PORT=":${MASTER_HTTP_PORT}"
-	if [ -z $SLAVE_NODE ]; then
+	if [ -z "$SLAVE_NODE" ]; then
 		SLAVE_NODE=${SLAVE_NODE:-`hostname -s | tr '[:upper:]' '[:lower:]'`}
 		echo
 		read -p "Name of this slave on ${MASTER_NAME} [$SLAVE_NODE]: " RESPONSE
-		SLAVE_NODE=${RESPONSE:-$SLAVE_NODE}
+		SLAVE_NODE="${RESPONSE:-$SLAVE_NODE}"
 	fi
 	if [ -z $MASTER_USER ]; then
 		[ "${SERVICE_USER}" != "jenkins" ] && MASTER_USER=${SERVICE_USER} || MASTER_USER=`whoami`
@@ -136,16 +146,16 @@ function configure_daemon {
 	echo "${MASTER_USER}'s API token is required to authenticate a JNLP slave."
 	echo "The API token is listed at ${MASTER}${MASTER_HTTP_PORT}/user/${MASTER_USER}/configure"
 	read -p "API token for ${MASTER_USER}: " SLAVE_TOKEN
-	while ! curl --url ${MASTER}${MASTER_HTTP_PORT}/user/${MASTER_USER} --user ${MASTER_USER}:${SLAVE_TOKEN} --silent --head --fail --output /dev/null ; do
+	while ! curl -L --url ${MASTER}${MASTER_HTTP_PORT}/user/${MASTER_USER} --user ${MASTER_USER}:${SLAVE_TOKEN} --insecure --silent --head --fail --output /dev/null ; do
 		echo "Unable to authenticate ${MASTER_USER} with this token"
 		read -p "API token for ${MASTER_USER}: " SLAVE_TOKEN
 	done
 	OSX_KEYCHAIN_PASS=${OSX_KEYCHAIN_PASS:-`env LC_CTYPE=C tr -dc "a-zA-Z0-9-_" < /dev/urandom | head -c 20`}
 	create_keychain
-	sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh set-password --password=${SLAVE_TOKEN} --account=${MASTER_USER} --service=${SLAVE_NODE}
-	KEYSTORE_PASS=`sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh get-password --account=${SERVICE_USER} --service=java_truststore`
+	sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh set-password --password=${SLAVE_TOKEN} --account=${MASTER_USER} --service=\"${SLAVE_NODE}\"
+	KEYSTORE_PASS=`sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh get-password --account=${SERVICE_USER} --service=java_truststore`
 	KEYSTORE_PASS=${KEYSTORE_PASS:-`env LC_CTYPE=C tr -dc "a-zA-Z0-9-_" < /dev/urandom | head -c 20`}
-	sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh set-password --password=${KEYSTORE_PASS} --account=${SERVICE_USER} --service=java_truststore
+	sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh set-password --password=${KEYSTORE_PASS} --account=${SERVICE_USER} --service=java_truststore
 	if [ "$PROTOCOL" == "https" ]; then
 		echo "
 If the certificate for ${MASTER_NAME} is not trusted by Java, you will need 
@@ -160,7 +170,7 @@ certificates.
 To install certificates, you will need to:
 1) copy or download the certificates into ${SERVICE_HOME}
 2) use the following command:
-sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh add-java-certificate \
+sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh add-java-certificate \
 --alias=AN_ALIAS --certificate=/path/to/certificate
 If the certificate is a Root CA cert, add the --ca-cert flag to the above
 command.
@@ -186,7 +196,7 @@ not be protected by a password.
 		read -p "Create SSH keys? (yes/no) [yes]" CONFIRM
 		CONFIRM=${CONFIRM:-yes}
 		if [[ "${CONFIRM}" =~ ^[Yy] ]] ; then
-			sudo -i -u ${SERVICE_USER} ssh-keygen -t rsa -N '' -f ${SERVICE_HOME}/.ssh/id_rsa -C "${SERVICE_USER}@${SLAVE_NODE}"
+			sudo -i -u ${SERVICE_USER} ssh-keygen -t rsa -N \'\' -f ${SERVICE_HOME}/.ssh/id_rsa -C \"${SERVICE_USER}@${SLAVE_NODE}\"
 		fi
 		echo "
 You will need to connect to each SSH host as ${SERVICE_USER} to add the host
@@ -224,15 +234,15 @@ function configure_adc {
 	CONFIRM=${CONFIRM:-yes}
 	if [[ "${CONFIRM}" =~ ^[Yy] ]] ; then
 		echo "Importing WWDR intermediate certificate..."
-		sudo -i -u ${SERVICE_USER} curl  --silent --remote-name --url https://developer.apple.com/certificationauthority/AppleWWDRCA.cer
-		sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh add-apple-certificate --certificate=${SERVICE_HOME}/AppleWWDRCA.cer
+		sudo -i -u ${SERVICE_USER} curl  --silent -L --remote-name --url https://developer.apple.com/certificationauthority/AppleWWDRCA.cer
+		sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh add-apple-certificate --certificate=${SERVICE_HOME}/AppleWWDRCA.cer
 		sudo -i rm ${SERVICE_HOME}/AppleWWDRCA.cer
 		echo "
 You will need to import your own developer certificates following these steps:
 1) Export the Certificate and Key from Keychain for your developer profiles.
 2) sudo cp /path/to/exported-keys-and-certificates ${SERVICE_HOME}
 3) For each certificate and key (this is a single multiline command):
-   sudo -i -u ${SERVICE_USER} ${SERVICE_HOME}/security.sh \
+   sudo -i -u ${SERVICE_USER} ${SERVICE_WRKSPC}/security.sh \
    add-apple-certificate --certificate=${SERVICE_HOME}/name-of-exported-cert
 "
 	fi
@@ -242,7 +252,7 @@ function create_keychain {
 	local KEYCHAINS=${SERVICE_HOME}/Library/Keychains
 	if [ ! -d ${KEYCHAINS} ]; then
 		sudo mkdir -p ${KEYCHAINS}
-		sudo chown -R ${SERVICE_USER}:${SERVICE_USER} ${KEYCHAINS}
+		sudo chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${KEYCHAINS}
 	fi
 	if [ ! -f ${KEYCHAINS}/${OSX_KEYCHAIN} ]; then
 		sudo -i -u ${SERVICE_USER} security create-keychain -p ${OSX_KEYCHAIN_PASS} ${OSX_KEYCHAIN}
@@ -250,8 +260,8 @@ function create_keychain {
 			sudo chmod 666 ${KEYCHAINS}/.keychain_pass
 		fi
 		sudo chmod 777 ${KEYCHAINS}
-		sudo echo "OSX_KEYCHAIN_PASS=${OSX_KEYCHAIN_PASS}" > ${KEYCHAINS}/.keychain_pass
-		sudo chown -R ${SERVICE_USER}:${SERVICE_USER} ${KEYCHAINS} 
+		sudo sh -c "echo 'OSX_KEYCHAIN_PASS=${OSX_KEYCHAIN_PASS}' > ${KEYCHAINS}/.keychain_pass"
+		sudo chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${KEYCHAINS} 
 		sudo chmod 400 ${KEYCHAINS}/.keychain_pass
 		sudo chmod 755 ${KEYCHAINS}
 	fi
@@ -267,21 +277,29 @@ ${SLAVE_NODE} to connect to ${MASTER_NAME}.
 }
 
 function write_config {
+	# ensure JAVA_ARGS specifies a setting for java.awt.headless (default to true)
+	[[ "$JAVA_ARGS" =~ -Djava.awt.headless= ]] || JAVA_ARGS="${JAVA_ARGS} -Djava.awt.headless=true"
+	# create config directory
 	sudo mkdir -p `dirname ${SERVICE_CONF}`
 	sudo chmod 777 `dirname ${SERVICE_CONF}`
+	# make the config file writable
 	if [ -f ${SERVICE_CONF} ]; then
 		sudo chmod 666 ${SERVICE_CONF}
 	fi
+	# write the config file
 	[[ "$MASTER_HTTP_PORT" =~ ^: ]] && MASTER_HTTP_PORT=${MASTER_HTTP_PORT#":"}
-	:> ${SERVICE_CONF}
-	echo "JENKINS_SLAVE=${SLAVE_NODE}" >> ${SERVICE_CONF}
-	echo "JENKINS_MASTER=${MASTER}" >> ${SERVICE_CONF}
-	echo "HTTP_PORT=${MASTER_HTTP_PORT}" >> ${SERVICE_CONF}
-	echo "JENKINS_USER=${MASTER_USER}" >> ${SERVICE_CONF}
-	echo "JAVA_ARGS=${JAVA_ARGS}" >> ${SERVICE_CONF}
+	local CONF_TMP=${INSTALL_TMP}/org.jenkins-ci.slave.jnlp.conf
+	:> ${CONF_TMP}
+	echo "JENKINS_SLAVE=\"${SLAVE_NODE}\"" >> ${CONF_TMP}
+	echo "JENKINS_MASTER=${MASTER}" >> ${CONF_TMP}
+	echo "HTTP_PORT=${MASTER_HTTP_PORT}" >> ${CONF_TMP}
+	echo "JENKINS_USER=${MASTER_USER}" >> ${CONF_TMP}
+	echo "JAVA_ARGS=\"${JAVA_ARGS}\"" >> ${CONF_TMP}
+	sudo mv ${CONF_TMP} ${SERVICE_CONF}
+	# secure the config file
 	sudo chmod 755 `dirname ${SERVICE_CONF}`
 	sudo chmod 644 ${SERVICE_CONF}
-	sudo chown -R ${SERVICE_USER}:${SERVICE_USER} ${SERVICE_HOME}
+	sudo chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${SERVICE_HOME}
 }
 
 function start_daemon {
@@ -289,9 +307,9 @@ function start_daemon {
 The Jenkins JNLP Slave service is installed
 
 This service can be started using the command
-	sudo launchctl load org.jenkins-ci.slave.jnlp.plist
+    sudo launchctl load /Library/LaunchDaemons/org.jenkins-ci.slave.jnlp.plist
 and stopped using the command
-	sudo launchctl unload org.jenkins-ci.slave.jnlp.plist
+    sudo launchctl unload /Library/LaunchDaemons/org.jenkins-ci.slave.jnlp.plist
 
 This service logs to /var/log/${SERVICE_USER}/org.jenkins-ci.slave.jnlp.log
 "
@@ -313,6 +331,24 @@ function cleanup {
 	exit $1
 }
 
+function rawurlencode() {
+	# see http://stackoverflow.com/a/10660730/176160
+	local string="${1}"
+	local strlen=${#string}
+	local encoded=""
+
+	for (( pos=0 ; pos<strlen ; pos++ )); do
+		c=${string:$pos:1}
+		case "$c" in
+			[-_.~a-zA-Z0-9] ) o="${c}" ;;
+			* )               printf -v o '%%%02x' "'$c"
+		esac
+		encoded+="${o}"
+	done
+	echo "${encoded}"    # You can either set a return variable (FASTER) 
+	REPLY="${encoded}"   #+or echo the result (EASIER)... or both... :p
+}
+
 echo "
         _          _   _              _ _  _ _    ___   ___ _              
      _ | |___ _ _ | |_(_)_ _  ___  _ | | \| | |  | _ \ / __| |__ ___ _____ 
@@ -324,6 +360,9 @@ This script will download, install, and configure a Jenkins JNLP Slave on OS X.
 You must be an administrator on the system you are installing the Slave on,
 since this installer will add a user to the system and then configure the slave
 as that user.
+
+A Java Development Kit (JDK) must be installed prior to installing the Jenkins
+JNLP Slave.
 
 During the configuration, you will be prompted for necessary information. The
 suggested or default response will be in brackets [].
@@ -338,7 +377,10 @@ if [[ "${CONFIRM}" =~ ^[Yy] ]] ; then
 		cleanup 1
 	fi
 	create_user
-	process_args $@
+	
+	# $@ must be quoted in order to handle arguments that contain spaces
+	# see http://stackoverflow.com/a/8198970/14731
+	process_args "$@"
 	echo "Installing files..."
 	install_files
 	echo "Configuring daemon..."
